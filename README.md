@@ -30,19 +30,19 @@ From the official GNOME Shell Extensions website:
 
 Or
 
-[latest]: https://github.com/ionutbortis/gnome-bedtime-mode/releases/download/v22.0/gnome-bedtime-mode_22.0.zip
+[latest]: https://github.com/ionutbortis/gnome-bedtime-mode/releases/download/v23.0/gnome-bedtime-mode_23.0.zip
 
-You can download the [latest release package][latest] and manually install it to your extensions folder. The latest package only supports Gnome versions '47' and '48'!
+You can download the [latest release package][latest] and manually install it to your extensions folder. The latest package only supports Gnome versions '47', '48' and '49'!
 
 For older Gnome versions please use the official [GNOME Shell Extensions website][ego] mentioned above.
 
 ```
-wget https://github.com/ionutbortis/gnome-bedtime-mode/releases/download/v22.0/gnome-bedtime-mode_22.0.zip
+wget https://github.com/ionutbortis/gnome-bedtime-mode/releases/download/v23.0/gnome-bedtime-mode_23.0.zip
 # (Or manually download via browser and run the next commands from the download folder)
 
-gnome-extensions install --force gnome-bedtime-mode_22.0.zip
+gnome-extensions install --force gnome-bedtime-mode_23.0.zip
 
-rm gnome-bedtime-mode_22.0.zip
+rm gnome-bedtime-mode_23.0.zip
 ```
 
 Next, you need to log out and log in again into your user account
@@ -69,7 +69,7 @@ If you want to use a keyboard shortcut in order to toggle the Bedtime Mode then 
 
 - Go to "Settings -> Keyboard -> Keyboard Shortcuts"
 - Click on "View and Customize Shortcuts"
-- Go to "Custom Shortcuts" and click "Add Shortcut" or the "+" button
+- Go to "Custom Shortcuts" and click the "+" button
 - Fill the inputs with the following
   - Name: Toggle Bedtime Mode
   - Command:
