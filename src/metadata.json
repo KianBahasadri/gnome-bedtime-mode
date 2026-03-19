@@ -4,8 +4,8 @@
   "name": "Bedtime Mode",
   "settings-schema": "org.gnome.shell.extensions.bedtime-mode",
   "gettext-domain": "bedtime-mode",
-  "shell-version": ["47", "48", "49"],
+  "shell-version": ["50"],
   "url": "https://github.com/ionutbortis/gnome-bedtime-mode",
   "uuid": "gnomebedtime@ionutbortis.gmail.com",
-  "version": 23
+  "version": 24
 }
