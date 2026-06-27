@@ -3,3 +3,4 @@ src/ui/*.ui~
 po/*.po~
 build/
 auto-grayscale/.env
+__pycache__/
