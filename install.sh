@@ -32,8 +32,9 @@ if [[ ! -f "$DAEMON_DIR/.env" && -f "$DAEMON_DIR/.env.example" ]]; then
     cp "$DAEMON_DIR/.env.example" "$DAEMON_DIR/.env"
 fi
 
-# Install the systemd unit. Use %h so the service is relocatable.
-cp "$DAEMON_DIR/auto-grayscale.service" "$UNIT_DIR/auto-grayscale.service"
+# Install the systemd unit, substituting the actual daemon path.
+sed "s|@DAEMON_PATH@|$DAEMON|" "$DAEMON_DIR/auto-grayscale.service" \
+    > "$UNIT_DIR/auto-grayscale.service"
 
 systemctl --user daemon-reload
 systemctl --user enable --now auto-grayscale.service

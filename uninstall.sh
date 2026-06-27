@@ -9,7 +9,15 @@ EXT_UUID="gnomebedtime@ionutbortis.gmail.com"
 
 echo "==> Stopping auto-grayscale daemon..."
 systemctl --user disable --now auto-grayscale.service 2>/dev/null || true
-rm -f "$UNIT_DIR/auto-grayscale.service"
+
+# Find the installed unit file (handles XDG_CONFIG_HOME changes since install).
+UNIT_PATH="$(systemctl --user show -p FragmentPath auto-grayscale.service 2>/dev/null \
+    | sed 's/^FragmentPath=//' || true)"
+if [[ -n "$UNIT_PATH" && -f "$UNIT_PATH" ]]; then
+    rm -f "$UNIT_PATH"
+elif [[ -f "$UNIT_DIR/auto-grayscale.service" ]]; then
+    rm -f "$UNIT_DIR/auto-grayscale.service"
+fi
 systemctl --user daemon-reload
 
 echo "==> Turning off bedtime mode..."

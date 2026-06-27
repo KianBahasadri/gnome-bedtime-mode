@@ -81,9 +81,23 @@ def load_env():
             if key:
                 values[key] = raw.strip().strip("'\"")
 
-    LAT = float(values["LAT"])
-    LON = float(values["LON"])
-    SUN_ALTITUDE = float(values["SUN_ALTITUDE"])
+    try:
+        LAT = float(values["LAT"])
+    except (ValueError, TypeError):
+        print(f"warning: .env LAT={values.get('LAT')!r} invalid, using default {_DEFAULT_LAT}", file=sys.stderr)
+        LAT = _DEFAULT_LAT
+
+    try:
+        LON = float(values["LON"])
+    except (ValueError, TypeError):
+        print(f"warning: .env LON={values.get('LON')!r} invalid, using default {_DEFAULT_LON}", file=sys.stderr)
+        LON = _DEFAULT_LON
+
+    try:
+        SUN_ALTITUDE = float(values["SUN_ALTITUDE"])
+    except (ValueError, TypeError):
+        print(f"warning: .env SUN_ALTITUDE={values.get('SUN_ALTITUDE')!r} invalid, using default {_DEFAULT_SUN_ALTITUDE}", file=sys.stderr)
+        SUN_ALTITUDE = _DEFAULT_SUN_ALTITUDE
 
     if "DISABLED" in values:
         ENABLED = not _parse_bool(values["DISABLED"])
@@ -91,12 +105,14 @@ def load_env():
         ENABLED = _parse_bool(values["ENABLED"])
 
 
-def sun_times(lat, lon, year, month, day):
-    """Return (sunrise, sunset) as timezone-aware UTC datetimes for the given
-    calendar date, or (None, None) if the sun does not rise/set that day.
+def _solar_cos_w(lat, lon, year, month, day):
+    """Shared solar calculation — returns (cos_w, j_transit, lamr).
+
+    cos_w is the hour-angle cosine: > 1 means the sun never rises (polar
+    night), < -1 means it never sets (midnight sun).
 
     Based on the sunrise equation (https://en.wikipedia.org/wiki/Sunrise_equation),
-    accurate to roughly a minute.
+    accurate to a few minutes for modern dates at mid-latitudes.
     """
     a = (14 - month) // 12
     y = year + 4800 - a
@@ -129,9 +145,16 @@ def sun_times(lat, lon, year, month, day):
     cos_w = (
         math.sin(math.radians(SUN_ALTITUDE)) - math.sin(latr) * sin_d
     ) / (math.cos(latr) * cos_d)
-    if cos_w > 1:
-        return None, None
-    if cos_w < -1:
+    return cos_w, j_transit, lamr
+
+
+def sun_times(lat, lon, year, month, day):
+    """Return (sunrise, sunset) as timezone-aware UTC datetimes for the given
+    calendar date, or (None, None) if the sun does not rise/set that day
+    (polar night or midnight sun — use polar_state() to tell them apart).
+    """
+    cos_w, j_transit, lamr = _solar_cos_w(lat, lon, year, month, day)
+    if cos_w > 1 or cos_w < -1:
         return None, None
     w = math.degrees(math.acos(cos_w))
 
@@ -142,6 +165,16 @@ def sun_times(lat, lon, year, month, day):
     return jd_to_dt(j_transit - w / 360.0), jd_to_dt(j_transit + w / 360.0)
 
 
+def polar_state(lat, lon, year, month, day):
+    """Return 'night' (polar night), 'day' (midnight sun), or None (normal)."""
+    cos_w, _, _ = _solar_cos_w(lat, lon, year, month, day)
+    if cos_w > 1:
+        return "night"
+    if cos_w < -1:
+        return "day"
+    return None
+
+
 def sun_times_for(local_date):
     return sun_times(LAT, LON, local_date.year, local_date.month, local_date.day)
 
@@ -149,6 +182,12 @@ def sun_times_for(local_date):
 def todays_sun_times():
     """(sunrise, sunset) UTC datetimes for the current *local* date."""
     return sun_times_for(datetime.now().astimezone().date())
+
+
+def todays_polar_state():
+    """'night', 'day', or None for the current local date."""
+    d = datetime.now().astimezone().date()
+    return polar_state(LAT, LON, d.year, d.month, d.day)
 
 
 def is_night(now, sunrise, sunset):
@@ -222,10 +261,18 @@ def cmd_daemon():
         now = datetime.now(timezone.utc)
         sunrise, sunset = todays_sun_times()
         try:
-            if ENABLED and sunrise and sunset:
+            if not ENABLED:
+                set_bedtime_mode(False)
+            elif sunrise and sunset:
                 set_bedtime_mode(is_night(now, sunrise, sunset))
             else:
-                set_bedtime_mode(False)
+                polar = todays_polar_state()
+                if polar == "night":
+                    set_bedtime_mode(True)
+                elif polar == "day":
+                    set_bedtime_mode(False)
+                else:
+                    set_bedtime_mode(False)
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"skipped: bedtime-mode schema not reachable ({e})", flush=True)
         sleep = _clamp(seconds_until_next_event(now), 30, MAX_IDLE_SECONDS)
@@ -235,9 +282,21 @@ def cmd_daemon():
 def cmd_apply():
     load_env()
     sunrise, sunset = todays_sun_times()
-    if not ENABLED or sunrise is None or sunset is None:
+    if not ENABLED:
         set_bedtime_mode(False)
-        print("bedtime mode off (disabled or no sun data)")
+        print("bedtime mode off (disabled)")
+        return
+    if sunrise is None or sunset is None:
+        polar = todays_polar_state()
+        if polar == "night":
+            set_bedtime_mode(True)
+            print("bedtime mode on (polar night)")
+        elif polar == "day":
+            set_bedtime_mode(False)
+            print("bedtime mode off (midnight sun)")
+        else:
+            set_bedtime_mode(False)
+            print("bedtime mode off (no sun data)")
         return
     now = datetime.now(timezone.utc)
     active = is_night(now, sunrise, sunset)
@@ -265,6 +324,14 @@ def cmd_status():
     print(f"now:         {datetime.now().astimezone().strftime('%-I:%M %p')}")
     if sunrise and sunset:
         print(f"is night:    {'yes' if is_night(now, sunrise, sunset) else 'no'}")
+    else:
+        polar = todays_polar_state()
+        if polar == "night":
+            print("is night:    yes (polar night)")
+        elif polar == "day":
+            print("is night:    no (midnight sun)")
+        else:
+            print("is night:    n/a (no sun data)")
     if bedtime_mode_available():
         print(f"bedtime:     {'on' if current_active() else 'off'}")
     else:
