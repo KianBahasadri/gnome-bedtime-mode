@@ -1,0 +1,13 @@
+[Unit]
+Description=auto-grayscale: toggle bedtime mode at sunset/sunrise
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/gnome-bedtime-mode/auto-grayscale/auto-grayscale daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

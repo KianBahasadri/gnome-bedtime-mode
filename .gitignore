@@ -2,3 +2,4 @@ src/schemas/gschemas.compiled
 src/ui/*.ui~
 po/*.po~
 build/
+auto-grayscale/.env

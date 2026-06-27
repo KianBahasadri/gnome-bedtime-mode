@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""auto-grayscale: toggle GNOME Bedtime Mode on at sunset and off at sunrise.
+
+Drives the "bedtime-mode-active" GSettings key from gnome-bedtime-mode using
+local sunrise/sunset calculations (the standard sunrise equation, no external
+packages). A systemd user service runs this as a daemon; manual on/off/apply
+commands are also available.
+
+Configuration can also live in a .env file next to this script (see .env.example).
+The daemon re-reads it every loop iteration, so set ENABLED=false there to keep
+the screen in color while the service keeps running.
+
+Subcommands:
+  daemon   Run continuously, toggling bedtime mode at sun events.
+  apply    Toggle bedtime mode correctly for "now", then exit.
+  on       Force bedtime mode on.
+  off      Force bedtime mode off.
+  status   Print sun times and current state.
+  times    Print today's sunrise and sunset.
+"""
+
+import math
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_PATH = SCRIPT_DIR / ".env"
+
+# ---------------------------------------------------------------------------
+# Configuration -- edit these for your location, or override via .env.
+# Latitude is north-positive, longitude is east-positive.
+# Toronto, ON:
+_DEFAULT_LAT = 43.6532
+_DEFAULT_LON = -79.3832
+# Sun altitude (degrees) that counts as sunrise/sunset. -0.833 is the standard
+# value (sun's upper limb at the horizon, accounting for refraction).
+# Use -6 for civil twilight if you want the switch a bit later/earlier.
+_DEFAULT_SUN_ALTITUDE = -0.833
+_DEFAULT_ENABLED = True
+
+LAT = _DEFAULT_LAT
+LON = _DEFAULT_LON
+SUN_ALTITUDE = _DEFAULT_SUN_ALTITUDE
+ENABLED = _DEFAULT_ENABLED
+# ---------------------------------------------------------------------------
+
+# Daemon timing.
+MAX_IDLE_SECONDS = 60       # longest sleep between checks
+
+# gnome-bedtime-mode exposes one key: "bedtime-mode-active" (boolean).
+BEDTIME_SCHEMA = "org.gnome.shell.extensions.bedtime-mode"
+
+
+def _parse_bool(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_env():
+    """Reload configuration from .env, falling back to script defaults."""
+    global LAT, LON, SUN_ALTITUDE, ENABLED
+
+    values = {
+        "LAT": _DEFAULT_LAT,
+        "LON": _DEFAULT_LON,
+        "SUN_ALTITUDE": _DEFAULT_SUN_ALTITUDE,
+        "ENABLED": _DEFAULT_ENABLED,
+    }
+
+    if ENV_PATH.is_file():
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            key = key.strip().upper()
+            if key:
+                values[key] = raw.strip().strip("'\"")
+
+    LAT = float(values["LAT"])
+    LON = float(values["LON"])
+    SUN_ALTITUDE = float(values["SUN_ALTITUDE"])
+
+    if "DISABLED" in values:
+        ENABLED = not _parse_bool(values["DISABLED"])
+    else:
+        ENABLED = _parse_bool(values["ENABLED"])
+
+
+def sun_times(lat, lon, year, month, day):
+    """Return (sunrise, sunset) as timezone-aware UTC datetimes for the given
+    calendar date, or (None, None) if the sun does not rise/set that day.
+
+    Based on the sunrise equation (https://en.wikipedia.org/wiki/Sunrise_equation),
+    accurate to roughly a minute.
+    """
+    a = (14 - month) // 12
+    y = year + 4800 - a
+    m = month + 12 * a - 3
+    jdn = (
+        day
+        + (153 * m + 2) // 5
+        + 365 * y
+        + y // 4
+        - y // 100
+        + y // 400
+        - 32045
+    )
+
+    n = jdn - 2451545 + 0.0008
+    j_star = n - lon / 360.0
+
+    M = (357.5291 + 0.98560028 * j_star) % 360
+    Mr = math.radians(M)
+    C = 1.9148 * math.sin(Mr) + 0.0200 * math.sin(2 * Mr) + 0.0003 * math.sin(3 * Mr)
+    lam = (M + C + 180 + 102.9372) % 360
+    lamr = math.radians(lam)
+
+    j_transit = 2451545.0 + j_star + 0.0053 * math.sin(Mr) - 0.0069 * math.sin(2 * lamr)
+
+    sin_d = math.sin(lamr) * math.sin(math.radians(23.4397))
+    cos_d = math.cos(math.asin(sin_d))
+
+    latr = math.radians(lat)
+    cos_w = (
+        math.sin(math.radians(SUN_ALTITUDE)) - math.sin(latr) * sin_d
+    ) / (math.cos(latr) * cos_d)
+    if cos_w > 1:
+        return None, None
+    if cos_w < -1:
+        return None, None
+    w = math.degrees(math.acos(cos_w))
+
+    def jd_to_dt(jd):
+        unix = (jd - 2440587.5) * 86400.0
+        return datetime.fromtimestamp(unix, tz=timezone.utc)
+
+    return jd_to_dt(j_transit - w / 360.0), jd_to_dt(j_transit + w / 360.0)
+
+
+def sun_times_for(local_date):
+    return sun_times(LAT, LON, local_date.year, local_date.month, local_date.day)
+
+
+def todays_sun_times():
+    """(sunrise, sunset) UTC datetimes for the current *local* date."""
+    return sun_times_for(datetime.now().astimezone().date())
+
+
+def is_night(now, sunrise, sunset):
+    """True outside the daytime band (before sunrise or after sunset)."""
+    return now < sunrise or now >= sunset
+
+
+def seconds_until_next_event(now=None):
+    """Seconds until the next sunrise or sunset (today or tomorrow)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    today = datetime.now().astimezone().date()
+    events = []
+    for off in (0, 1):
+        sr, ss = sun_times_for(today + timedelta(days=off))
+        if sr and ss:
+            events += [sr, ss]
+    future = [e for e in events if e > now]
+    return (min(future) - now).total_seconds() if future else MAX_IDLE_SECONDS
+
+
+# --- gsettings plumbing -----------------------------------------------------
+
+def _gset(schema, key, value):
+    subprocess.run(["gsettings", "set", schema, key, value], check=True)
+
+
+def _gget(schema, key):
+    return subprocess.run(
+        ["gsettings", "get", schema, key],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def bedtime_mode_available():
+    """True if the bedtime-mode extension's GSettings schema is installed."""
+    try:
+        _gget(BEDTIME_SCHEMA, "bedtime-mode-active")
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def current_active():
+    """Current value of bedtime-mode-active (True/False)."""
+    try:
+        return _gget(BEDTIME_SCHEMA, "bedtime-mode-active") == "true"
+    except subprocess.CalledProcessError:
+        return False
+
+
+def set_bedtime_mode(active):
+    """Idempotently set bedtime-mode-active."""
+    desired = active
+    if current_active() != desired:
+        _gset(BEDTIME_SCHEMA, "bedtime-mode-active", str(desired).lower())
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_daemon():
+    load_env()
+    print("auto-grayscale daemon started "
+          f"(enabled {'yes' if ENABLED else 'no'})", flush=True)
+    if not bedtime_mode_available():
+        print("note: gnome-bedtime-mode extension not loaded yet "
+              "(log out and back in to load it); bedtime mode has no effect "
+              "until then.", flush=True)
+    while True:
+        load_env()
+        now = datetime.now(timezone.utc)
+        sunrise, sunset = todays_sun_times()
+        try:
+            if ENABLED and sunrise and sunset:
+                set_bedtime_mode(is_night(now, sunrise, sunset))
+            else:
+                set_bedtime_mode(False)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"skipped: bedtime-mode schema not reachable ({e})", flush=True)
+        sleep = _clamp(seconds_until_next_event(now), 30, MAX_IDLE_SECONDS)
+        time.sleep(sleep)
+
+
+def cmd_apply():
+    load_env()
+    sunrise, sunset = todays_sun_times()
+    if not ENABLED or sunrise is None or sunset is None:
+        set_bedtime_mode(False)
+        print("bedtime mode off (disabled or no sun data)")
+        return
+    now = datetime.now(timezone.utc)
+    active = is_night(now, sunrise, sunset)
+    set_bedtime_mode(active)
+    print(f"bedtime mode {'on' if active else 'off'}")
+
+
+def _fmt(dt):
+    return "n/a" if dt is None else dt.astimezone().strftime("%-I:%M %p")
+
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def cmd_status():
+    load_env()
+    sunrise, sunset = todays_sun_times()
+    env_note = f" ({ENV_PATH})" if ENV_PATH.is_file() else ""
+    print(f"enabled:     {'yes' if ENABLED else 'no'}{env_note}")
+    print(f"location:    {LAT}, {LON}")
+    print(f"sunrise:     {_fmt(sunrise)}")
+    print(f"sunset:      {_fmt(sunset)}")
+    now = datetime.now(timezone.utc)
+    print(f"now:         {datetime.now().astimezone().strftime('%-I:%M %p')}")
+    if sunrise and sunset:
+        print(f"is night:    {'yes' if is_night(now, sunrise, sunset) else 'no'}")
+    if bedtime_mode_available():
+        print(f"bedtime:     {'on' if current_active() else 'off'}")
+    else:
+        print("bedtime:     n/a (extension not loaded -- log out and back in)")
+
+
+def cmd_times():
+    load_env()
+    sunrise, sunset = todays_sun_times()
+    print(f"sunrise {_fmt(sunrise)}  sunset {_fmt(sunset)}")
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "daemon":
+        cmd_daemon()
+    elif cmd == "apply":
+        cmd_apply()
+    elif cmd == "on":
+        try:
+            set_bedtime_mode(True)
+            print("bedtime mode on")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("error: bedtime-mode schema not installed -- install gnome-bedtime-mode")
+            return 1
+    elif cmd == "off":
+        try:
+            set_bedtime_mode(False)
+            print("bedtime mode off")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("error: bedtime-mode schema not installed -- install gnome-bedtime-mode")
+            return 1
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "times":
+        cmd_times()
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+load_env()
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
